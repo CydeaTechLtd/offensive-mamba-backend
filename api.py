@@ -29,7 +29,9 @@ import re
 from bs4 import BeautifulSoup
 from urllib.parse import parse_qs
 from qlai import QLAI
+import vulners
 DEBUG = 'DEBUG' in os.environ
+VULNERS_API_KEY = os.environ['vulners_api_key']
 DBHANDLE = DatabaseHandler()
 
 connected_clients = {}
@@ -157,6 +159,19 @@ class UserView(FlaskView):
     #     if (not FlaskAPI.check_token()) or "username" not in request.json.keys():
     #         return {"status": False, "error": "You are not logged in to access this resource."}, 403
     #     return DBHANDLE.verify_public_ip(request.json['username'])
+
+class ExploitCVEView(FlaskView):
+    def before_request(self, name):
+        FlaskAPI.check_token()
+    
+    @route('/searchVulnersByID', methods=['POST'])
+    def searchvulnersbyId(self):
+        if "username" not in request.json.keys():
+            return {'success': False, 'error': "You are no logged in to access this resource."}
+        if "resId" not in request.json.keys():
+            return {'success': False, 'error': "Please provide resource ID."}
+        vulners_api = vulners.Vulners(api_key=VULNERS_API_KEY)
+        return vulners_api.document(request.json['resId'])
 
 
 class AgentView(FlaskView):
