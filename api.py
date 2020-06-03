@@ -160,7 +160,7 @@ class UserView(FlaskView):
     #         return {"status": False, "error": "You are not logged in to access this resource."}, 403
     #     return DBHANDLE.verify_public_ip(request.json['username'])
 
-class ExploitCVEView(FlaskView):
+class ExploitView(FlaskView):
     def before_request(self, name):
         FlaskAPI.check_token()
     
@@ -256,7 +256,7 @@ class FlaskAPI(Flask):
         SignupView.register(self)
         UserView.register(self)
         AgentView.register(self)
-        ExploitCVEView.register(self)
+        ExploitView.register(self)
 
     @staticmethod
     def check_token() -> bool:
