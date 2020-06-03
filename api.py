@@ -162,7 +162,7 @@ class UserView(FlaskView):
 
 class ExploitView(FlaskView):
     representations = {'application/json': APIUtils.output_json}
-    
+
     def before_request(self, name):
         FlaskAPI.check_token()
     
@@ -179,6 +179,9 @@ class ExploitView(FlaskView):
 class AgentView(FlaskView):
     def before_request(self, name):
         FlaskAPI.check_token()
+
+    def post(self):
+        return {"success": True}
 
     @route('/addlocalsystem', methods=['POST'])
     def addlocalsystem(self):
