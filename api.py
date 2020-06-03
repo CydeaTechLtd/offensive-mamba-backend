@@ -161,6 +161,8 @@ class UserView(FlaskView):
     #     return DBHANDLE.verify_public_ip(request.json['username'])
 
 class ExploitView(FlaskView):
+    representations = {'application/json': APIUtils.output_json}
+    
     def before_request(self, name):
         FlaskAPI.check_token()
     
