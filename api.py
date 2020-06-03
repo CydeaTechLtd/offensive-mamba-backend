@@ -256,6 +256,7 @@ class FlaskAPI(Flask):
         SignupView.register(self)
         UserView.register(self)
         AgentView.register(self)
+        ExploitCVEView.register(self)
 
     @staticmethod
     def check_token() -> bool:
