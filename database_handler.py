@@ -6,7 +6,7 @@ import random
 from uuid import uuid4
 from mongoengine import connect
 from api_utils import APIUtils
-from models import User, LocalSystem, ScanningEvent, ExploitingEvent
+from models import User, LocalSystem, ScanningEvent, ExploitingEvent, PyExploit, PostExploitationEvent
 import json
 validate = APIUtils.validate
 from datetime import datetime
@@ -183,7 +183,6 @@ class DatabaseHandler:
             raise ValueError("Invalid value for CodeFor argument. Must be one of {}".format(
                 str(APIUtils.valid_code_for_choices)))
         else:
-            # TODO Add a check for error so False can be returned for error
             code = random.randint(100000, 999999)
             user.recoveryCode = code
             user.codeFor = code_for
@@ -208,6 +207,45 @@ class DatabaseHandler:
             "verifiedPublicIP": user.verifiedPublicIP
         }
         return {"success": True, "data": data}
+    
+    def change_user_info(self, username, firstname, lastname, companyname):
+        errors = {}
+        users = User.objects(username=username)
+        if users.count() == 0:
+            return {"success": False, "error": "Username does not exist."}
+        
+        user:User = users[0]
+        
+        # First Name
+        if firstname == "":
+            errors['firstname'] = "First name cannot be empty"
+        elif not validate("firstname", firstname):
+            errors['firstname'] = "First name contains invalid characters and/or it should be more than 2 and less then 20 characters long."
+
+        # Last Name
+        if lastname == "":
+            errors['lastname'] = "Last name cannot be empty"
+        elif not validate("lastname", lastname):
+            errors['lastname'] = "Last name contains invalid characters and/or it should be more than 2 and less then 20 characters long."
+        
+        # Comapny Name
+        if companyname == "":
+            errors['companyname'] = "Compnay name cannot be empty."
+        elif not validate("companyname", companyname):
+            errors['companyname'] = "Company name contains invalid characters and/or it should be more than 2 and less then 64 characters long."
+        
+        # if there are errors return
+        if errors != {}:
+            return {'success': False, 'errors': errors}
+        
+        user.firstName = firstname
+        user.lastName = lastname
+        user.companyName = companyname
+
+        user.save()
+
+        return {'success': True, 'message': "Profile updated successfully!"}
+        
 
     def verify_email_address(self, username: str, code: int) -> dict:
         # "Warning"? Issue in pylint: https://github.com/MongoEngine/mongoengine/issues/858
@@ -433,6 +471,20 @@ class DatabaseHandler:
         event.save()
         return {'success': True, 'message': "Exploitation Event Logged!!", 'event': event}
     
+    def insert_post_exploitation_log(self, username: str, localip: str, post_exploit: str, output: str, using: str, success: bool, scanningevent: ScanningEvent) -> dict:
+        if not self.username_exists(username):
+            return {'success': False, 'error': 'Invalid Username!'}
+        if not validate('ipaddress', localip):
+            return {'success': False, 'error': 'Invalid IPv4 Address!'}
+        user: User = User.objects(username=username)[0]
+        localsys: list = LocalSystem.objects(userId=user, localIP=localip)
+        if localsys.count() == 0:
+            return {'success': False, 'error': 'This IPv4 does not exists in you IPv4 Pool.'}
+        lsystem: LocalSystem = localsys[0]
+        event = PostExploitationEvent(systemId=lsystem, executedUsing=using, postExploit=post_exploit, output=output, success=success, scanId=scanningevent)
+        event.save()
+        return {'success': True, 'message': "Post Exploitation Event Logged!!", 'event': event}
+    
     def get_exploitation_data(self, username: str, localip: str) -> dict:
         if not self.username_exists(username):
             return {'success': False, 'error': 'Invalid Username!'}
@@ -485,4 +537,50 @@ class DatabaseHandler:
             events_data.append(event_data)
         return {'success': True, 'data': events_data}
 
-    # TODO DO POST EXPLOITATION
+    def get_latest_post_exploitation_data(self, username: str, localip: str) -> dict:
+        if not self.username_exists(username):
+            return {'success': False, 'error': 'Invalid Username!'}
+        if not validate('ipaddress', localip):
+            return {'success': False, 'error': 'Invalid IPv4 Address!'}
+        user: User = User.objects(username=username)[0]
+        localsys: list = LocalSystem.objects(userId=user, localIP=localip)
+        if localsys.count() == 0:
+            return {'success': False, 'error': 'This IPv4 does not exists in you IPv4 Pool.'}
+        lsystem: LocalSystem = localsys[0]
+        if lsystem.lastScanTime is None:
+            return {'success': True, 'data': {}}
+        scanevents: list = ScanningEvent.objects(systemId=lsystem, scanTime=lsystem.lastScanTime)
+        if scanevents.count() == 0:
+            lsystem.lastScanTime = None
+            lsystem.save()
+            return {'success': True, 'data': {}}
+        scanevent = scanevents[0]
+        post_exploit_events: list = PostExploitationEvent.objects(systemId=lsystem, scanId=scanevent, success=True)
+        events_data = []
+        for event in post_exploit_events:
+            event_data = {}
+            event_data['postexploit'] = event.postExploit
+            event_data['output'] = event.output
+            event_data['using'] = event.executedUsing
+            event_data['timestamp'] = event.timestamp
+            events_data.append(event_data)
+        return {'success': True, 'data': events_data}
+
+    def get_compatible_py_exploits(self, platform, product, exploit_type):
+        exploits: list = PyExploit.objects(platform=platform, product=product)
+        exploits_data = []
+        for exploit in exploits:
+            exploit_data = {}
+            exploit_data['edbid'] = exploit.edbid
+            exploit_data['friendlyname'] = exploit.friendlyName
+            exploit_data['platform'] = exploit.platform
+            exploit_data['description']: exploit.description
+            exploit_data['options'] = exploit.options
+            exploit_data['version'] = exploit.version
+            exploit_data['published_date'] = exploit.publishedDate
+            exploit_data['requirements'] = exploit.requirements
+            exploit_data['exploit_type'] = exploit.exploitType
+            exploit_data['author'] = exploit.author
+            if exploit_data['exploit_type'] == exploit_type and exploit_data['platform'] == platform and exploit_data['product'] == product:
+                exploits_data.append(exploit_data)
+        return {'success': True, 'data': exploits_data}

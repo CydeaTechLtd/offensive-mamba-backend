@@ -4,3 +4,4 @@ flask_cors
 python-socketio
 eventlet
 jwt
+vulners

@@ -12,7 +12,8 @@ from mongoengine import (
     DictField,
     DateTimeField,
     UUIDField,
-    ListField
+    ListField,
+    DecimalField
 )
 from api_utils import APIUtils
 
@@ -51,7 +52,7 @@ class ExploitingEvent(Document):
     systemId = ReferenceField(LocalSystem, required=True)
     scanId = ReferenceField(ScanningEvent, required=True)
     timestamp = DateTimeField(required=True, default=datetime.now())
-    exploitedUsing = StringField(required=True, choices=['Metasploit'])
+    exploitedUsing = StringField(required=True, choices=['Metasploit', 'PySploit'])
     success = BooleanField(required=True, default=False)
     exploit = StringField(required=True)
     payload = StringField(required=True)
@@ -61,4 +62,25 @@ class ExploitingEvent(Document):
     # sessionType = StringField(reuired=True)
 
 class PostExploitationEvent(Document):
-    exploitationId = ReferenceField(ExploitingEvent, required=True)
+    systemId = ReferenceField(LocalSystem, required=True)
+    scanId = ReferenceField(ScanningEvent, required=True)
+    timestamp = DateTimeField(required=True, default=datetime.now())
+    success = BooleanField(required=True, default=False)
+    executedUsing = StringField(required=True, choices=['Metasploit', 'PySploit'])
+    postExploit = StringField(required=True)
+    output = StringField(required=True)
+
+class PyExploit(Document):
+    edbid = IntField(required=True)
+    friendlyName = StringField(required=True)
+    author = DictField(default={'name': "Unknown", 'url': "http://exploit-db.com/"}, required=True)
+    exploitType = StringField(required=True, choices=['remote'])
+    platform = StringField(required=True)
+    publishedDate = DateTimeField(required=True, default=datetime.now())
+    cve = StringField(required=False, null=True, sparse=True)
+    requirements = ListField(required=True, default=[])
+    description = StringField(required=True, default="")
+    options = DictField(required=True, default={'RHOST': ''})
+    product = StringField(required=True, default="")
+    version = DecimalField(required=True, default=0.0)
+

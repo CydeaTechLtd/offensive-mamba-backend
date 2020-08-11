@@ -14,8 +14,8 @@ class QLAI:
         self.locked = False
         
     def get_actions(self, os, product, version, port):
-        if DEBUG:
-            print("Inside Function: get_actions")
+        # if DEBUG:
+        #     print("Inside Function: get_actions")
         self._get_lock()
         for row in self.tbl:
             state = row['state']
@@ -24,51 +24,56 @@ class QLAI:
             _version = state['version']
             _port = state['port']
             if _os == os and _product == product and _version == version and _port == port:
+                # if DEBUG:
+                #     print("Lock Released")
                 self.locked = False
                 return row['actions']
+        # if DEBUG:
+        #     print("Lock Released")
         self.locked = False
         return None
     def get_reward(self, os, product, version, port, engine, exploit, payload):
-        if DEBUG:
-            print("Inside Function: get_reward")
+        # if DEBUG:
+        #     print("Inside Function: get_reward")
         actions = self.get_actions(os, product, version, port)
         self._get_lock()
         if actions is None:
-            if DEBUG:
-                print("Lock Released")
+            # if DEBUG:
+            #     print("Lock Released")
             self.locked = False
             return 0
         else:
             for action in actions:
-                if DEBUG:
-                    print(action)
+                # if DEBUG:
+                #     print(action)
                 _engine = action[0]['engine']
                 _exploit = action[0]['exploit']
                 _payload = action[0]['payload']
                 if engine == _engine and exploit == _exploit and payload == _payload:
                     reward = action[1]
-                    if DEBUG:
-                        print("Lock Released")
+                    # if DEBUG:
+                    #     print("Lock Released")
                     self.locked = False
                     return reward
-            if DEBUG:
-                print("Lock Released")
+            # if DEBUG:
+            #     print("Lock Released")
             self.locked = False
             return 0
     
     def _get_lock(self):
-        if DEBUG:
-            print("Inside Function: _get_lock")
-        if DEBUG:
-            print("Lock Requested")
+        # if DEBUG:
+        #     print("Inside Function: _get_lock")
+        # if DEBUG:
+        #     print("Lock Requested")
         while self.locked:
             continue
-        print("Locked")
+        # if DEBUG:
+        #     print("Locked")
         self.locked = True
 
     def step(self, os, product, version, port, engine, exploit, payload):
-        if DEBUG:
-            print("Inside Function: step")
+        # if DEBUG:
+        #     print("Inside Function: step")
         prev_reward = self.get_reward(os, product, version, port, engine, exploit, payload)
         if prev_reward == -1:
             return False
@@ -77,8 +82,8 @@ class QLAI:
 
         
     def set_reward(self, os, product, version, port, engine, exploit, payload, reward):
-        if DEBUG:
-            print("Inside Function: get_reward")
+        # if DEBUG:
+        #     print("Inside Function: set_reward")
         actions = self.get_actions(os, product, version, port)
         self._get_lock()
         if actions is None:
@@ -89,14 +94,14 @@ class QLAI:
                 'port': port
             }
             _actions = []
-            _actions.append(({
+            _actions.append([{
                 "engine": engine,
                 "exploit": exploit,
                 "payload": payload
-            }, reward))
+            }, reward])
             self.tbl.append({'state': _state, 'actions': _actions})
-            if DEBUG:
-                print("Lock Released")
+            # if DEBUG:
+            #     print("Lock Released")
             self.locked = False
         else:
             for i in range(len(self.tbl)):
@@ -112,20 +117,25 @@ class QLAI:
                     _payload = _actions[j][0]['payload']
                     if _os == os and _product == product and _version == version and _port == port and _engine == engine and _exploit == exploit and _payload == payload:
                         self.tbl[i]['actions'][j][1] = reward
-                        if DEBUG:
-                            print("Lock Released")
+                        # if DEBUG:
+                        #     print("Lock Released")
                         self.locked = False
                         return
-        if DEBUG:
-            print("Lock Released")
+                # Append if not already in actions
+                self.tbl[i]['actions'].append([{'engine': engine, 'exploit': exploit, 'payload': payload}, reward])
+                # if DEBUG:
+                #     print("Lock Released")
+                self.locked = False
+        # if DEBUG:
+        #     print("Lock Released")
         self.locked = False
     
     def save_file(self):
-        if DEBUG:
-            print("Inside Function: save_file")
+        # if DEBUG:
+        #     print("Inside Function: save_file")
         self._get_lock()
-        if DEBUG:
-            print(self.tbl)
+        # if DEBUG:
+        #     print(self.tbl)
         with open(self.tblfile, "w") as f:
             json.dump(self.tbl, f)
         self.locked = False
